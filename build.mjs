@@ -40,7 +40,7 @@ fs.writeFileSync(conf, JSON.stringify({
   main: cjs, output: blob, disableExperimentalSEAWarning: true,
   assets: { 'node_datachannel.node': addon, 'index.php': path.join(root, 'index.php') },
 }));
-execFileSync(process.execPath, ['--experimental-sea-config', conf], { stdio: ['ignore', 'ignore', 'inherit'] });
+try { execFileSync(process.execPath, ['--experimental-sea-config', conf], { stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { fail('could not pack the executable:\n' + (e.stderr || e.message)); }
 
 step(`build    ${rel}`);
 fs.copyFileSync(process.execPath, out);
