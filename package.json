@@ -1,0 +1,26 @@
+{
+  "name": "localdrop",
+  "version": "1.0.0",
+  "description": "send files between your devices locally",
+  "license": "MIT",
+  "bin": {
+    "localdrop": "localdrop.mjs"
+  },
+  "files": [
+    "localdrop.mjs",
+    "index.php"
+  ],
+  "engines": {
+    "node": ">=18.20"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "node-datachannel": "^0.33.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "1.0.0-alpha.6"
+  }
+}
