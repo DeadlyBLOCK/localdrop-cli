@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import dgram from 'node:dgram';
+import dns from 'node:dns';
+import net from 'node:net';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
@@ -21,6 +24,7 @@ const OSES = ['ios', 'android', 'windows', 'macos', 'linux', 'chromeos'];
 const ID_RE = /^p[a-f0-9]{15}$/;
 const NO_ROUTE = "couldn't connect. this network may block devices from reaching each other (guest wi-fi, client isolation).";
 const DEFAULT_ICE = ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'];
+const LOCAL_PORT = 47800, DISCO_PORT = 47801, DISCO_GROUP = '239.255.47.80';
 
 /* ---------- helpers ---------- */
 const hex = (n) => crypto.randomBytes(n).toString('hex');
@@ -101,25 +105,29 @@ const HELP = `localdrop ${VERSION} · send files between your devices
 
 usage
   localdrop [files...]              open the interface (files start staged)
-  localdrop host [--port 8080]      share from this computer: relay + web page, no server needed
   localdrop send <files...>         send without the interface (stdin is sent as a note)
   localdrop recv                    receive without the interface
   localdrop devices                 list nearby devices
-  localdrop serve [--port 8080]     run only the relay and web page (headless)
+  localdrop serve                   run only the relay and web page (headless, e.g. on a server)
+
+  computers running localdrop on the same network find each other by themselves,
+  and each one serves the web page so phones can join by scanning its qr code.
 
 options
-  -s, --server <url>    relay address (where index.php is hosted)      env LOCALDROP_SERVER
-  -r, --room <code>     use a private room instead of this network
+  -s, --server <url>    use a relay on the internet instead (where index.php is hosted)  env LOCALDROP_SERVER
+      --local           use this network even when LOCALDROP_SERVER is set
+  -r, --room <code>     use a private room instead of everyone on this network
   -n, --name <name>     device name shown to others
   -o, --out <dir>       where received files are saved
-  -t, --to <name>       send: target device (name, prefix, or "all")
+  -t, --to <name>       send: target device (name, prefix, "all", or an address like 192.168.1.20)
       --text <text>     send: send a note instead of files
       --from <name>     recv: only accept from this device
   -y, --yes             recv: accept without asking
       --count <n>       recv: exit after n transfers
       --json            devices: machine-readable output
-      --web <file>      host/serve: index.php for the web page (default: next to localdrop, or built in)
-      --bind <addr>     host/serve: listen address (default 0.0.0.0)
+      --port <n>        port for the web page and other computers (default 47800)
+      --web <file>      index.php for the web page (default: next to localdrop, or built in)
+      --bind <addr>     listen address (default 0.0.0.0)
       --theme <t>       auto, dark, light, ansi or mono                 env NO_COLOR
       --no-mouse        keep the terminal's own mouse selection
   -h, --help            show this help
@@ -133,7 +141,7 @@ keys
 function parseArgs(argv) {
   const out = { cmd: 'tui', files: [], f: {} };
   const short = { s: 'server', r: 'room', n: 'name', o: 'out', t: 'to', y: 'yes', h: 'help', v: 'version', p: 'port' };
-  const bools = new Set(['yes', 'help', 'version', 'json', 'no-mouse']);
+  const bools = new Set(['yes', 'help', 'version', 'json', 'no-mouse', 'local']);
   const vals = new Set(['server', 'room', 'name', 'out', 'to', 'from', 'text', 'port', 'bind', 'web', 'theme', 'count']);
   const cmds = { send: 'send', recv: 'recv', receive: 'recv', devices: 'devices', host: 'host', serve: 'serve', help: 'help', version: 'version' };
   let i = 0, rest = false;
@@ -190,7 +198,9 @@ function debug(...a) { const log = process.env.LOCALDROP_DEBUG; if (log) try { f
 
 /* ---------- state ---------- */
 const me = { secret: hex(24), name: '', kind: process.platform === 'android' ? 'phone' : 'computer', os: { darwin: 'macos', win32: 'windows', linux: 'linux', android: 'android' }[process.platform] || '' };
-let SERVER = '', SHARE = '', room = '', OUT = '', ICE = DEFAULT_ICE;
+let SERVER = '', SHARE = '', room = '', OUT = '', ICE = DEFAULT_ICE, LOCAL = false;
+const LAN = { sock: null, port: 0, on: false, err: '', sendErr: '', queues: new Map(), inflight: new Set(), timer: 0, ticks: 0 };
+me.lanId = 'p' + hex(8).slice(0, 15);
 const peers = new Map(), conns = new Map(), ended = new Map(), stray = new Map();
 const outbox = [], received = [], asks = [], history = [];
 const autoAccept = new Set(), reserved = new Set();
@@ -257,7 +267,12 @@ async function poll() {
 }
 
 let flushing = false, flushT = 0, flushFails = 0;
-function signal(to, d) { outbox.push({ to, d, room }); if (!flushT && !flushing) flushT = setTimeout(flush, 25); }
+function signal(to, d) {
+  const c = conns.get(d.c), p = peers.get(to), lan = (p && p.lan) || (c && c.peer === to && c.lan);
+  if (lan) return lanSignal(to, lan, d);
+  outbox.push({ to, d, room });
+  if (!flushT && !flushing) flushT = setTimeout(flush, 25);
+}
 const keep = (m) => m.room === room && (m.d.k === 'cancel' || m.d.k === 'decline' || (conns.has(m.d.c) && !conns.get(m.d.c).dead));
 async function flush() {
   clearTimeout(flushT);
@@ -289,7 +304,7 @@ async function flush() {
 }
 function undelivered(m, code) {
   const c = conns.get(m.d.c);
-  if (c && !c.dead && m.d.k !== 'cancel' && m.d.k !== 'decline') fail(c, code === 0 ? c.peerName + ' went offline' : "couldn't reach " + c.peerName, false);
+  if (c && !c.dead && m.d.k !== 'cancel' && m.d.k !== 'decline') fail(c, code === 0 ? c.peerName + ' went offline' : "couldn't reach " + c.peerName + (code === -2 ? '. a firewall on it may be blocking localdrop' : ''), false);
 }
 
 function onSignal(from, d) {
@@ -317,19 +332,22 @@ function reconcile(list) {
     seen.add(p.id);
     const name = cleanName(p.name) || 'device', kind = KINDS.includes(p.kind) ? p.kind : 'computer';
     const os = OSES.includes(p.os) ? p.os : '', bg = p.bg === true, peer = peers.get(p.id);
-    if (!peer) { peers.set(p.id, { id: p.id, name, kind, os, bg, flash: null, since: Date.now() }); changed = true; }
+    if (!peer) { peers.set(p.id, { id: p.id, name, kind, os, bg, lan: null, flash: null, since: Date.now() }); changed = true; }
     else if (name !== peer.name || kind !== peer.kind || os !== peer.os || bg !== peer.bg) { Object.assign(peer, { name, kind, os, bg }); changed = true; }
   }
-  for (const id of peers.keys()) if (!seen.has(id)) { peers.delete(id); changed = true; }
+  for (const [id, p] of peers) if (!p.lan && !seen.has(id)) { peers.delete(id); changed = true; }
+  checkGone();
+  if (changed) hooks.peers();
+  hooks.change();
+}
+function checkGone() {
   const t = Date.now();
   for (const c of conns.values()) {
     if (c.dead || (c.state !== 'asking' && c.state !== 'connecting')) continue;
-    if (seen.has(c.peer)) c.goneAt = 0;
+    if (peers.has(c.peer)) c.goneAt = 0;
     else if (!c.goneAt) c.goneAt = t;
     else if (t - c.goneAt > 6000) fail(c, c.peerName + ' went offline', false);
   }
-  if (changed) hooks.peers();
-  hooks.change();
 }
 
 /* ---------- connections ---------- */
@@ -340,7 +358,7 @@ function makeConn(id, peer, role) {
     id, peer, role, pc: null, ch: null, peerName: p ? p.name : 'the other device', peerKind: p ? p.kind : 'computer', state: 'new', dead: false,
     opened: false, remoteSet: false, sigReady: false, offered: false, iceOut: [], iceIn: [], iceT: 0, timer: 0, discT: 0, goneAt: 0, askEnd: 0,
     what: null, files: null, isText: false, manifest: null, offer: null, label: '', total: 0, count: 0, sent: 0, done: 0, rx: null, got: [],
-    announced: 0, file: '', t: Date.now(), t0: 0, endAt: 0, rate: 0, mark: null, error: '', route: '', drain: null,
+    announced: 0, file: '', t: Date.now(), t0: 0, endAt: 0, rate: 0, mark: null, error: '', route: '', drain: null, lan: p && p.lan ? { ...p.lan } : null,
   };
   conns.set(id, c);
   return c;
@@ -713,6 +731,7 @@ function setRoom(code) {
   for (const c of conns.values()) if (!c.dead && (c.state === 'asking' || c.state === 'connecting')) fail(c, 'switched rooms');
   room = code;
   peers.clear();
+  if (LAN.on) lanBeacon(true);
   hooks.peers();
   hooks.change();
   pollNow();
@@ -722,9 +741,203 @@ async function stopCore() {
   for (const c of conns.values()) if (!c.dead) c.state === 'asking' && c.role === 'recv' ? decline(c) : fail(c, 'cancelled');
   stopped = true;
   clearTimeout(pollT);
-  await Promise.race([Promise.all([flush(), leave()]), sleep(1500)]);
+  await Promise.race([Promise.all([flush(), leave(), lanIdle()]), sleep(1500)]);
+  await stopLan();
   for (const c of [...conns.values()]) teardown(c);
   try { if (RTC) RTC.cleanup(); } catch {}
+}
+
+/* ---------- local network: computers find each other and signal directly ---------- */
+let roomTag = ['', ''];
+const lanRoom = () => (roomTag[0] === room ? roomTag[1] : (roomTag = [room, room ? crypto.createHash('sha256').update('localdrop|' + room).digest('hex').slice(0, 16) : ''])[1]);
+const lanQ = (id) => { let q = LAN.queues.get(id); if (!q) LAN.queues.set(id, (q = { msgs: [], held: [], busy: false, route: null, away: 0 })); return q; };
+const lanAway = (id) => { const q = LAN.queues.get(id); return !!q && Date.now() < q.away; };
+const lanBuf = (t, q, w) => Buffer.from(JSON.stringify({ ld: 1, t, q, w, id: me.lanId, name: me.name, kind: me.kind, os: me.os, port: LAN.port, room: lanRoom() }));
+function lanUdp(msg, ip, port = DISCO_PORT, cb = () => {}) { if (!LAN.sock) return cb(new Error('closed')); try { LAN.sock.send(msg, port, ip, cb); } catch (e) { cb(e); } }
+function bcastTargets() {
+  const out = new Set(['255.255.255.255', DISCO_GROUP]);
+  for (const list of Object.values(os.networkInterfaces())) for (const a of list || []) {
+    if ((a.family !== 'IPv4' && a.family !== 4) || a.internal || !a.netmask) continue;
+    const ip = a.address.split('.').map(Number), m = a.netmask.split('.').map(Number);
+    out.add(ip.map((o, i) => (o & m[i]) | (~m[i] & 255)).join('.'));
+  }
+  return [...out];
+}
+function lanBeacon(q = false, t = 'hi') {
+  if (!LAN.sock) return;
+  const msg = lanBuf(t, q), list = bcastTargets();
+  let left = list.length, good = 0, bad = '';
+  for (const a of list) lanUdp(msg, a, DISCO_PORT, (e) => { if (e) bad = e.code || 'error'; else good++; if (--left === 0 && t === 'hi') LAN.sendErr = good ? '' : bad; });
+}
+function lanUpsert(b, ip) {
+  if (!b || typeof b.id !== 'string' || !ID_RE.test(b.id) || b.id === me.lanId || typeof b.port !== 'number' || !ip) return null;
+  const port = b.port, name = cleanName(typeof b.name === 'string' ? b.name : '') || 'device', kind = KINDS.includes(b.kind) ? b.kind : 'computer', osn = OSES.includes(b.os) ? b.os : '';
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  let p = peers.get(b.id);
+  if (p && !p.lan) return null;
+  if (p && (p.lan.ip !== ip || p.lan.port !== port) && Date.now() - p.seen < 9000 && !lanAway(p.id)) return p;
+  if (!p) {
+    if ([...peers.values()].filter((x) => x.lan).length >= 64) return null;
+    peers.set(b.id, (p = { id: b.id, name, kind, os: osn, bg: false, lan: { ip, port }, seen: 0, helloAt: 0, flash: null, since: Date.now() }));
+    hooks.peers();
+  } else if (p.name !== name || p.kind !== kind || p.os !== osn || p.lan.ip !== ip || p.lan.port !== port) {
+    if (p.lan.ip !== ip || p.lan.port !== port) lanQ(p.id).away = 0;
+    Object.assign(p, { name, kind, os: osn, lan: { ip, port } });
+  }
+  p.seen = Date.now();
+  hooks.change();
+  return p;
+}
+function lanDrop(id) { const p = peers.get(id); if (p && p.lan) { peers.delete(id); checkGone(); hooks.peers(); hooks.change(); } }
+async function lanPost(route, body, ms = 4000) {
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), ms);
+  LAN.inflight.add(ac);
+  try {
+    const host = route.ip.includes(':') ? '[' + route.ip + ']' : route.ip;
+    const res = await fetch(`http://${host}:${route.port}/lan`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: ac.signal,
+      body: JSON.stringify({ ld: 1, from: me.lanId, name: me.name, kind: me.kind, os: me.os, port: LAN.port, room: lanRoom(), msgs: [], ...body }),
+    });
+    const chunks = [];
+    let d = null, n = 0;
+    try { for await (const ch of res.body) { n += ch.length; if (n > 65536) break; chunks.push(ch); } if (n <= 65536) d = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
+    if (!res.ok || !d || typeof d !== 'object' || d.ok !== true) throw Object.assign(new Error(String((d && d.error) || 'http ' + res.status).slice(0, 40)), { status: res.status });
+    return d;
+  } finally { clearTimeout(timer); LAN.inflight.delete(ac); }
+}
+function lanTake(d, ip) {
+  const p = lanUpsert(d, ip);
+  if (p && Array.isArray(d.msgs)) for (const m of d.msgs.slice(0, MAX_BATCH)) if (validSignal(m)) { try { onSignal(p.id, m); } catch (e) { debug(e); } }
+  return p;
+}
+function lanHello(p, now = false) {
+  const t = Date.now(), q = lanQ(p.id), r = p.lan;
+  if (!LAN.on || p.helloBusy || t < q.away || t - p.helloAt < (now ? 200 : 700)) return;
+  p.helloAt = t;
+  p.helloBusy = true;
+  lanPost(r, { to: p.id }).then((d) => { q.away = 0; lanTake(d, r.ip); }, (e) => { if (e.message === 'gone') lanDrop(p.id); else if (!e.status) q.away = Date.now() + 10000; })
+    .catch(debug).finally(() => { p.helloBusy = false; });
+}
+function lanAnnounce() { if (!LAN.on) return; lanBeacon(); for (const p of peers.values()) if (p.lan) lanHello(p, true); }
+function lanSignal(to, route, d) {
+  const q = lanQ(to);
+  q.route = route;
+  q.msgs.push(d);
+  if (!q.busy) lanPump(to, q).catch(debug);
+}
+async function lanPump(to, q) {
+  q.busy = true;
+  try {
+    while (q.msgs.length) {
+      const batch = q.msgs.splice(0, 24), route = q.route;
+      let e = null;
+      if (Date.now() >= q.away && !q.held.length) {
+        try { lanTake(await lanPost(route, { to, msgs: batch }, 2500), route.ip); q.away = 0; continue; } catch (x) { e = x; }
+        if (e.status) { batch.forEach((d) => undelivered({ to, d }, e.message === 'gone' || e.message === 'room' ? 0 : -1)); continue; }
+        q.away = Date.now() + 10000;
+      }
+      const t = Date.now();
+      for (const d of batch) q.held.push({ d, t });
+      if (q.held.length > 256) q.held.splice(0, q.held.length - 256);
+      lanUdp(lanBuf('hi', false, 1), route.ip);
+    }
+  } finally { q.busy = false; }
+}
+const lanIdle = async () => { for (let i = 0; i < 30 && [...LAN.queues.values()].some((q) => q.busy); i++) await sleep(50); };
+function lanHandle(ip, inp) {
+  if (!LAN.on) return [404, { ok: false, error: 'off' }];
+  if (!inp || typeof inp !== 'object' || inp.ld !== 1 || typeof inp.from !== 'string' || !ID_RE.test(inp.from)) return [400, { ok: false, error: 'bad request' }];
+  if (inp.to != null && inp.to !== me.lanId) return [404, { ok: false, error: 'gone' }];
+  if (inp.room !== lanRoom()) return [409, { ok: false, error: 'room' }];
+  const src = String(ip || '').replace(/^::ffff:/i, ''), p = lanUpsert({ id: inp.from, name: inp.name, kind: inp.kind, os: inp.os, port: inp.port }, src);
+  if (!p) return [409, { ok: false, error: 'refused' }];
+  for (const d of Array.isArray(inp.msgs) ? inp.msgs.slice(0, MAX_BATCH) : []) if (validSignal(d)) { try { onSignal(p.id, d); } catch (e) { debug(e); } }
+  const q = p.lan.ip === src && LAN.queues.get(p.id);
+  return [200, { ok: true, ld: 1, id: me.lanId, name: me.name, kind: me.kind, os: me.os, port: LAN.port, room: lanRoom(), msgs: q ? q.held.splice(0, MAX_BATCH).map((x) => x.d) : [] }];
+}
+async function lanAdd(addr) {
+  const m = /^(?:https?:\/\/)?([a-z0-9.-]+|\[[0-9a-f:]+\])(?::(\d{1,5}))?\/?$/i.exec(String(addr).trim());
+  if (!m) throw new Error('type an address like 192.168.1.20 or 192.168.1.20:' + LOCAL_PORT);
+  let ip = m[1].replace(/^\[|\]$/g, '');
+  if (!net.isIP(ip)) try { ip = (await dns.promises.lookup(ip, { family: 4 })).address; } catch { throw new Error("can't find " + m[1] + ' on this network'); }
+  const route = { ip, port: Number(m[2] || LOCAL_PORT) };
+  let d;
+  try { d = await lanPost(route, { to: null }); } catch (e) { throw new Error(e.message === 'room' ? 'that computer is in another room' : 'nothing answered at ' + m[1] + ':' + route.port); }
+  if (d.id === me.lanId) throw new Error('that is this computer');
+  const p = lanTake(d, ip);
+  if (!p) throw new Error("couldn't add " + m[1]);
+  return p;
+}
+function lanMessage(buf, rinfo) {
+  try {
+    if (!LAN.on || buf.length > 4096) return;
+    const b = JSON.parse(buf.toString('utf8'));
+    if (!b || typeof b !== 'object' || b.ld !== 1 || typeof b.id !== 'string' || b.id === me.lanId) return;
+    if (b.room !== lanRoom() || b.t === 'bye') return lanDrop(b.id);
+    const known = peers.has(b.id), p = lanUpsert(b, rinfo.address), t = Date.now();
+    if (!p) return;
+    if (!known || b.q || b.w) lanHello(p, !!b.w);
+    if ((b.q || lanAway(p.id)) && t - (p.replyAt || 0) > 1000) { p.replyAt = t; lanUdp(lanBuf('hi', false), rinfo.address, rinfo.port); }
+  } catch (e) { debug(e); }
+}
+function lanJoin() { if (LAN.sock) for (const list of Object.values(os.networkInterfaces())) for (const a of list || []) if ((a.family === 'IPv4' || a.family === 4) && !a.internal) try { LAN.sock.addMembership(DISCO_GROUP, a.address); } catch {} }
+function lanTick() {
+  if (++LAN.ticks % 2 === 0) lanBeacon();
+  if (LAN.ticks % 30 === 0) lanJoin();
+  const t = Date.now(), busy = new Set();
+  for (const c of conns.values()) if (!c.dead && (c.state === 'asking' || c.state === 'connecting')) busy.add(c.peer);
+  for (const p of [...peers.values()]) {
+    if (!p.lan) continue;
+    if (t - p.seen > 9000) lanDrop(p.id);
+    else if (t - p.helloAt > (busy.has(p.id) ? 900 : 4000)) lanHello(p);
+  }
+  for (const [id, q] of LAN.queues) {
+    while (q.held.length && t - q.held[0].t > 15000) undelivered({ to: id, d: q.held.shift().d }, peers.has(id) ? -2 : 0);
+    if (!q.busy && !q.msgs.length && !q.held.length && !peers.has(id)) LAN.queues.delete(id);
+  }
+  checkGone();
+}
+const lanTrouble = () => !LAN.sock ? "can't listen for other computers here (" + (LAN.err || 'blocked') + ')'
+  : LAN.sendErr ? "can't reach this network (" + LAN.sendErr + ')' + (process.platform === 'darwin' ? '. allow your terminal app in system settings › privacy & security › local network' : '') : '';
+function startDiscovery() {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    let up = false;
+    sock.on('error', (e) => { debug('lan', e); if (!up) { LAN.err = e.code || e.message; try { sock.close(); } catch {} resolve(false); } });
+    sock.on('message', lanMessage);
+    sock.bind(DISCO_PORT, () => {
+      up = true;
+      try { sock.setBroadcast(true); sock.setMulticastTTL(1); sock.setMulticastLoopback(true); } catch {}
+      LAN.sock = sock;
+      lanJoin();
+      lanBeacon(true);
+      setTimeout(() => lanBeacon(true), 500);
+      resolve(true);
+    });
+  });
+}
+async function stopLan() {
+  if (!LAN.on) return;
+  LAN.on = false;
+  clearInterval(LAN.timer);
+  for (const ac of LAN.inflight) ac.abort();
+  lanBeacon(false, 'bye');
+  const sock = LAN.sock;
+  if (!sock) return;
+  await sleep(120);
+  lanBeacon(false, 'bye');
+  await sleep(30);
+  LAN.sock = null;
+  try { sock.close(); } catch {}
+}
+async function startLocal(o) {
+  HOSTED = await startRelay({ port: o.f.port || LOCAL_PORT, bind: o.f.bind || '0.0.0.0', web: o.f.web ? expand(o.f.web) : '', onLan: lanHandle });
+  SERVER = HOSTED.local;
+  SHARE = HOSTED.lan || HOSTED.local;
+  LOCAL = LAN.on = true;
+  LAN.port = HOSTED.port;
+  LAN.timer = setInterval(lanTick, 1000);
+  await startDiscovery();
 }
 
 /* ---------- built-in relay: a port of index.php's api, plus its web page ---------- */
@@ -777,7 +990,7 @@ async function webPage(web) {
   try { if (sea) return { page: pageFrom(sea.getAsset('index.php', 'utf8')), from: 'built in' }; } catch {}
   return { page: null, from: '' };
 }
-function createRelay({ page, hostIp }) {
+function createRelay({ page, hostIp, onLan }) {
   const key = crypto.randomBytes(32), rooms = new Map();
   const hmac = (s) => crypto.createHmac('sha256', key).update(s).digest('hex');
   const E = (code, error) => [code, { ok: false, error }];
@@ -859,7 +1072,7 @@ function createRelay({ page, hostIp }) {
         for await (const ch of req) { size += ch.length; if (size > MAX_BODY) return json(413, { ok: false, error: 'request too large' }); chunks.push(ch); }
         let inp = null;
         try { inp = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
-        const [code, body] = handle(req.socket.remoteAddress, inp);
+        const [code, body] = onLan && new URL(req.url, 'http://x').pathname === '/lan' ? (tooDeep(inp) ? [400, { ok: false, error: 'bad request' }] : onLan(req.socket.remoteAddress, inp)) : handle(req.socket.remoteAddress, inp);
         return json(code, body);
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { Allow: 'GET, HEAD, POST' }); return res.end(); }
@@ -892,15 +1105,16 @@ function listen(server, port, bind) {
     server.listen(port, bind);
   });
 }
-async function startRelay({ port = 8080, bind = '0.0.0.0', web = '' } = {}) {
-  const hostIp = lanIps()[0] || '';
+async function startRelay({ port = LOCAL_PORT, bind = '0.0.0.0', web = '', onLan = null } = {}) {
+  const any = !bind || bind === '0.0.0.0' || bind === '::', v6 = bind.includes(':');
+  const hostIp = any ? lanIps()[0] || '' : v6 || /^127\./.test(bind) ? '' : bind;
   const { page, from } = await webPage(web);
-  const r = createRelay({ page, hostIp });
+  const r = createRelay({ page, hostIp, onLan });
   let p;
   try { p = await listen(r.server, Number(port), bind); }
-  catch (e) { if (e.code !== 'EADDRINUSE') throw e; p = await listen(r.server, 0, bind); }
+  catch (e) { if (e.code !== 'EADDRINUSE' && e.code !== 'EACCES') throw e; p = await listen(r.server, 0, bind); }
   const lan = hostIp ? `http://${hostIp}:${p}/` : '';
-  return { ...r, port: p, hostIp, web: from, local: `http://127.0.0.1:${p}/`, lan };
+  return { ...r, port: p, hostIp, web: from, local: `http://${any ? '127.0.0.1' : v6 ? '[' + bind + ']' : bind}:${p}/`, lan };
 }
 
 /* ---------- qr code (byte mode, versions 1-10, ecc M then L), ported from index.php ---------- */
@@ -1428,7 +1642,6 @@ function peerViews() {
 function drawHeader(s) {
   const t = Date.now();
   s.put(s.put(1, 0, 'localdrop', T.bright), 0, Math.floor(t / 550) % 2 ? '_' : ' ', T.bright);
-  if (HOSTED) s.put(12, 0, ' hosting ', T.inv);
   const txt = fit(statusText(), s.w - 26), rx = s.w - 2 - sw(txt) - 2;
   s.put(rx, 0, '●', online === false ? T.err : online ? (Math.floor(t / 1200) % 2 ? T.bright : T.dim) : T.faint);
   s.put(rx + 2, 0, txt, online === false ? T.err : T.dim);
@@ -1595,12 +1808,16 @@ function drawRadar(s, x, y) {
 }
 function drawEmpty(s, x, y, w, h) {
   const url = shareUrl(), side = w >= RADAR.W + 4 + 34, tw = Math.min(46, side ? w - RADAR.W - 6 : w - 2);
-  const msg = room ? `this device is in room ${pretty(room)}. open the same link on your other device, or enter the code there.`
-    : HOSTED ? 'open this address on your other device, connected to the same wi-fi:' : 'open localdrop on your other device, connected to the same wi-fi:';
+  const msg = LOCAL ? (room ? `room ${pretty(room)}: computers on this network using the same code show up here by themselves. for a phone, open this address or scan the code:`
+      : 'computers running localdrop on this network show up here by themselves. for a phone, open this address or scan the code:')
+    : room ? `this device is in room ${pretty(room)}. open the same link on your other device, or enter the code there.` : 'open localdrop on your other device, connected to the same wi-fi:';
   const text = [[['looking for devices', T.bright], [Math.floor(Date.now() / 550) % 2 ? '_' : ' ', T.bright]], [], ...wrap(msg, tw).map((l) => [[l, T.fg]]), [], [[fitL(url, tw), T.hi]]];
   const qr = qrRows(url), qrOk = !!qr && side && text.length + 1 + qr.length + 2 <= h && qr[0].length <= w - RADAR.W - 6;
-  const tail = qrOk ? [[], ...wrap("or point your phone's camera at the code.", tw).map((l) => [[l, T.faint]])]
-    : [[], [['c', T.hi], [' qr code & link', T.faint], ...(room ? [] : [['   p', T.hi], [' private code', T.faint]])]];
+  const trouble = LOCAL ? lanTrouble() : '';
+  const stuck = trouble ? [[], ...wrap(trouble, tw).map((l) => [[l, T.err]]), [['c', T.hi], [' then ', T.faint], ['a', T.hi], [' to add a computer by its address', T.faint]]]
+    : LOCAL && Date.now() - U.startAt > 12000 ? [[], [['c', T.hi], [' not showing up? add a computer by its address', T.faint]]] : [];
+  const tail = qrOk ? [[], ...wrap("or point your phone's camera at the code.", tw).map((l) => [[l, T.faint]]), ...stuck]
+    : [[], [['c', T.hi], [' qr code & link', T.faint], ...(room ? [] : [['   p', T.hi], [' private code', T.faint]])], ...stuck];
   const body = (qrOk ? [...text, [], ...qr.map((l) => [[l, T.qr]]), ...tail] : [...text, ...tail]).slice(0, h);
   if (side) {
     const bh = Math.max(RADAR.H, body.length), bw = RADAR.W + 4 + Math.max(tw, qrOk ? qr[0].length : 0);
@@ -1718,14 +1935,16 @@ function drawAsk(s) {
 }
 function drawPair(s) {
   const m = U.modal, url = shareUrl(), qr = qrRows(url), qw = qr ? qr[0].length : 0, qh = qr ? qr.length : 0;
-  const explain = room ? 'private: only devices using this code see each other, on any network.'
-    : HOSTED ? 'devices on this wi-fi that open the link see each other. nothing leaves your network.'
+  const here = !HOSTED ? '' : HOSTED.hostIp ? 'at ' + HOSTED.hostIp + ':' + HOSTED.port : 'on port ' + HOSTED.port;
+  const explain = room ? 'private: only devices using this code see each other' + (LOCAL ? '. computers on this network with the same code appear by themselves.' : ', on any network.')
+    : LOCAL && !lanTrouble() ? 'computers running localdrop on this network appear by themselves. this one is ' + here + '.'
+    : LOCAL ? lanTrouble() + '. add other computers by address. this one is ' + here + '.'
     : "devices reaching the relay from the same internet connection see each other. if one doesn't show up, use a private code.";
   const side = !!qr && s.w >= qw + 52 && s.h >= qh + 12, top = !side && !!qr && s.w >= qw + 8 && s.h >= qh + 18;
   const w = Math.min(s.w - 4, side ? qw + 48 : 64), iw = w - 4, ex = wrap(explain, iw);
-  const intro = ['open this link on your other device,', qr && (side || top) ? 'or scan the code with its camera.' : 'or type the address there.'];
+  const intro = [LOCAL ? 'open this link on your phone,' : 'open this link on your other device,', qr && (side || top) ? 'or scan the code with its camera.' : 'or type the address there.'];
   const headH = side ? Math.max(qh, 6) : (top ? qh + 1 : 0) + 5;
-  const b = mbox(s, w, 2 + 1 + headH + 2 + 1 + ex.length + 2 + 1, 'connect a device', [['esc', T.hi], [' close', T.faint]]);
+  const b = mbox(s, w, 2 + 1 + headH + 2 + 1 + ex.length + 3 + 1, 'connect a device', [['esc', T.hi], [' close', T.faint]]);
   let y = b.iy + 1;
   if (side) {
     qr.forEach((l, i) => s.put(b.ix, y + i, l, T.qr));
@@ -1749,9 +1968,18 @@ function drawPair(s) {
   s.segs(b.ix, y++, [['room · ', T.dim], [room ? pretty(room) : 'this network', T.bright]]);
   for (const l of ex) s.put(b.ix, y++, l, T.dim);
   y++;
-  if (m.join) { s.put(b.ix, y, 'code', T.dim); drawField(s, b.ix + 5, y, b.iw - 5, m.join, 'abcd-efgh'); if (m.join.err) s.put(b.ix + b.iw - sw(m.join.err), y, m.join.err, T.err); }
-  else hints(s, b.ix, y, room ? [['p', 'new code', () => setRoom(newCode())], ['n', 'back to this network', () => setRoom('')], ['j', 'join a code', () => startJoin()]] : [['p', 'use a private code', () => setRoom(newCode())], ['j', 'join a code', () => startJoin()]]);
+  if (m.field) {
+    const lab = m.field.kind === 'add' ? 'address' : 'code';
+    s.put(b.ix, y, lab, T.dim);
+    drawField(s, b.ix + sw(lab) + 1, y, b.iw - sw(lab) - 1, m.field, m.field.kind === 'add' ? '192.168.1.20  (port ' + LOCAL_PORT + ' unless you add one)' : 'abcd-efgh');
+    if (m.field.err) s.put(b.ix, y + 1, fit(m.field.err, b.iw), m.field.busy ? T.dim : T.err);
+  } else hints(s, b.ix, y, pairActions());
 }
+const pairActions = () => [
+  ...(room ? [['p', 'new code', () => setRoom(newCode())], ['n', 'back to this network', () => setRoom('')]] : [['p', 'private code', () => setRoom(newCode())]]),
+  ['j', 'join a code', () => startField('join')],
+  ...(LOCAL ? [['a', 'add a computer by address', () => startField('add')]] : []),
+];
 function drawBrowse(s) {
   const m = U.modal, tgt = m.target && peers.get(m.target);
   const b = mbox(s, Math.min(86, s.w - 4), Math.min(s.h - 2, 34), tgt ? 'send to ' + fit(tgt.name, 28) : 'choose files', [['esc', T.hi], [' cancel', T.faint]]);
@@ -1825,7 +2053,7 @@ function drawInput(s) {
   if (m.err) s.put(b.ix, y + 1, fit(m.err, b.iw), T.err);
 }
 const HELP_KEYS = [
-  ['', 'devices'], ['f', 'choose files to send'], ['t', 'write a note'], ['c', 'connect a device: link, qr code, private rooms'], ['↵ / click', 'send to the selected device'],
+  ['', 'devices'], ['f', 'choose files to send'], ['t', 'write a note'], ['c', 'connect: qr code for phones, add a computer by address, rooms'], ['↵ / click', 'send to the selected device'],
   ['E', 'send to everyone'], ['arrows · hjkl', 'pick a device'], ['tab', 'switch between devices and activity'], ['r · o', 'rename this device · change the save folder'],
   ['esc', 'clear what is staged'], ['q · ctrl+c', 'quit'], ['', 'activity'], ['↵', 'open the file'], ['d', 'show it in its folder'], ['y', 'copy the note or the file path'],
   ['x', 'cancel a transfer or dismiss an entry'], ['R · X', 'retry a failed send · clear finished entries'], ['', 'anywhere'], ['drop · paste', 'drop files onto the terminal, or paste text, to send it'], ['y · n · a', "accept · decline · don't ask again"],
@@ -2051,22 +2279,29 @@ function quit() {
 }
 function openPair() {
   U.modal = {
-    type: 'pair', join: null,
-    hints: () => U.modal.join ? [['↵', 'join'], ['esc', 'back']] : [['y', 'copy link', () => copyText(shareUrl(), 'link copied')], ['p', room ? 'new code' : 'private code', () => setRoom(newCode())], ...(room ? [['n', 'this network', () => setRoom('')]] : []), ['j', 'join a code', startJoin], ['esc', 'close', closeModal]],
+    type: 'pair', field: null,
+    hints: () => U.modal.field ? [['↵', U.modal.field.kind === 'add' ? 'add' : 'join'], ['esc', 'back']] : [['y', 'copy link', () => copyText(shareUrl(), 'link copied')], ...pairActions(), ['esc', 'close', closeModal]],
   };
 }
-function startJoin() { if (U.modal && U.modal.type === 'pair') U.modal.join = { ...field(), err: '' }; }
+function startField(kind) { if (U.modal && U.modal.type === 'pair') U.modal.field = { kind, ...field(), err: '', busy: false }; }
 function pairKey(k) {
-  const m = U.modal;
-  if (m.join) {
-    if (k.name === 'escape') m.join = null;
-    else if (k.name === 'enter') {
-      const v = normCode(m.join.chars.join(''));
-      if (!validCode(v)) { m.join.err = '6 to 32 letters or digits'; return; }
-      m.join = null;
-      setRoom(v);
-      toast('joined room ' + pretty(v));
-    } else if (editField(m.join, k)) m.join.err = '';
+  const m = U.modal, f = m.field;
+  if (f) {
+    if (k.name === 'escape') m.field = null;
+    else if (k.name === 'enter' && !f.busy) {
+      const v = f.chars.join('').trim();
+      if (f.kind === 'join') {
+        const code = normCode(v);
+        if (!validCode(code)) { f.err = 'codes are 6 to 32 letters or digits'; return; }
+        m.field = null;
+        setRoom(code);
+        toast('joined room ' + pretty(code));
+      } else {
+        f.busy = true;
+        f.err = 'looking for localdrop at ' + v + '…';
+        lanAdd(v).then((p) => { if (m.field === f) m.field = null; toast('found ' + p.name); }, (e) => { f.busy = false; f.err = e.message; }).finally(draw);
+      }
+    } else if (!f.busy && editField(f, k)) f.err = '';
     return;
   }
   if (k.name === 'escape' || k.name === 'enter' || (k.name === 'char' && k.ch === 'q')) return closeModal();
@@ -2074,7 +2309,8 @@ function pairKey(k) {
   if (k.ch === 'y') copyText(shareUrl(), 'link copied');
   else if (k.ch === 'p') { setRoom(newCode()); toast('private room ' + pretty(room)); }
   else if (k.ch === 'n' && room) { setRoom(''); toast('back to this network'); }
-  else if (k.ch === 'j') startJoin();
+  else if (k.ch === 'j') startField('join');
+  else if (k.ch === 'a' && LOCAL) startField('add');
 }
 function openInput(o) {
   U.modal = { type: 'input', ...o, ...field(o.value || ''), err: '', hints: () => [['↵', o.ok || 'save'], ['esc', o.noCancel ? 'quit' : 'cancel']] };
@@ -2100,6 +2336,7 @@ function openRename() {
     me.name = n;
     saveConf({ name: n });
     pollNow();
+    lanAnnounce();
     toast('this device is now ' + n);
   } });
 }
@@ -2111,23 +2348,6 @@ function openOut() {
     saveConf({ out: p });
     toast('saving to ' + tilde(p));
   } });
-}
-function openSetup() {
-  openInput({
-    title: 'set up localdrop', label: 'relay', ok: 'connect', placeholder: 'https://drop.example.com', noCancel: true,
-    lines: ['localdrop finds your other devices through a small relay: the index.php from this repo, hosted anywhere that runs php.', '', 'paste its address. or quit and run "localdrop host" to share straight from this computer, no server needed.'],
-    submit: async (v) => {
-      const u = normServer(v);
-      if (!u) return "that doesn't look like a web address";
-      const prev = SERVER;
-      SERVER = u;
-      try { await api({ a: 'poll', s: me.secret, room, name: me.name, kind: me.kind, os: me.os, bg: false, ack: 0 }, 6000); }
-      catch (e) { SERVER = prev; return "couldn't reach a localdrop relay there (" + e.message + ')'; }
-      saveConf({ server: u });
-      startCore();
-      toast('connected to ' + new URL(u).host);
-    },
-  });
 }
 function openNote(target, text = '') {
   U.modal = { type: 'note', ...field(text), top: 0, target: target && peers.has(target) ? target : null, hints: () => [['↵', 'send'], ['ctrl+j', 'new line'], ...(peers.size > 1 ? [['tab', 'recipient']] : []), ['esc', 'cancel', closeModal]] };
@@ -2358,8 +2578,11 @@ async function runTui(o) {
   const missing = o.files.filter((f) => !fs.existsSync(expand(f)));
   if (o.files.length > missing.length) stage(o.files.filter((f) => fs.existsSync(expand(f))));
   if (missing.length) toast('no such file: ' + missing.join(', '), true);
-  if (HOSTED) toast(HOSTED.lan ? 'hosting on ' + HOSTED.lan.replace(/\/$/, '') + (HOSTED.hasPage ? '' : ' · web page missing, terminals only') : 'hosting on this computer only: no network found', !HOSTED.hasPage || !HOSTED.lan);
-  if (SERVER) startCore(); else openSetup();
+  U.startAt = Date.now();
+  if (LOCAL && !LAN.sock) toast("can't listen for other computers here (" + (LAN.err || 'blocked') + '). press c to add one by address.', true);
+  else if (HOSTED && !HOSTED.lan) toast('no network found: only this computer can see it', true);
+  if (HOSTED && !HOSTED.hasPage) toast('web page not found next to localdrop, so phones cannot join', true);
+  startCore();
   render();
   setInterval(() => {
     if (!termOn) return;
@@ -2465,10 +2688,13 @@ async function cmdSend(o) {
   say(C.dim(`looking for ${o.f.to ? '"' + o.f.to + '"' : 'a device'} on ${where()} as "${me.name}"…`));
   if (!(await waitOnline(12000))) { say(C.err('localdrop: ' + whyOff())); return 1; }
   let targets = [];
-  for (let t0 = Date.now(); Date.now() - t0 < 15000; await sleep(250)) { targets = matchPeers(o.f.to); if (targets === null || targets.length) break; }
+  if (LOCAL && /^(\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?|\[[0-9a-f:.]+\](:\d{1,5})?|[a-z0-9.-]+:\d{1,5}|[a-z0-9-]+\.local)$/i.test(o.f.to || '')) {
+    try { targets = [await lanAdd(o.f.to)]; } catch (e) { say(C.err('localdrop: ' + e.message)); return 1; }
+  } else for (let t0 = Date.now(); Date.now() - t0 < 15000; await sleep(250)) { targets = matchPeers(o.f.to); if (targets === null || targets.length) break; }
   if (!targets || !targets.length) {
     const names = [...peers.values()].map((p) => '"' + p.name + '"').join(', ');
-    say(C.err('localdrop: ' + (!names ? 'no devices found on ' + where() + '. open localdrop on the other device first.'
+    const why = LOCAL && lanTrouble();
+    say(C.err('localdrop: ' + (!names ? (why ? why + ". pass the other computer's address with --to." : 'no devices found on ' + where() + '. open localdrop on the other device first' + (LOCAL ? ', or pass its address with --to.' : '.'))
       : (targets === null ? (o.f.to ? `"${o.f.to}" matches more than one device: ` : 'more than one device is here, pick one with --to: ') : `no device matches "${o.f.to}". nearby: `) + names)));
     return 1;
   }
@@ -2519,7 +2745,8 @@ async function cmdRecv(o) {
   }
   startCore();
   if (!(await waitOnline(12000))) { live.stop(); say(C.err('localdrop: ' + whyOff())); return 1; }
-  live.log(C.dim(`ready as "${me.name}" on ${where()} · saving to ${tilde(OUT)}${o.f.yes ? ' · accepting everything' : ''} · ctrl+c to stop`));
+  if (LOCAL && lanTrouble()) live.log(C.err('localdrop: ' + lanTrouble()));
+  live.log(C.dim(`ready as "${me.name}" on ${where()} · saving to ${tilde(OUT)}${o.f.yes ? ' · accepting everything' : ''}${LOCAL ? ' · phones: ' + SHARE.replace(/\/$/, '') : ''} · ctrl+c to stop`));
   await all;
   live.stop();
   return failed && !finished ? 1 : 0;
@@ -2528,12 +2755,13 @@ async function cmdRecv(o) {
 async function cmdDevices(o) {
   startCore();
   if (!(await waitOnline(8000))) { say(C.err('localdrop: ' + whyOff())); return 1; }
+  if (LOCAL) await sleep(2500);
   const list = [...peers.values()];
-  if (o.f.json) process.stdout.write(JSON.stringify(list.map(({ id, name, kind, os, bg }) => ({ id, name, kind, os, background: bg })), null, 2) + '\n');
-  else if (!list.length) say(C.dim('no devices on ' + where() + ' yet'));
+  if (o.f.json) process.stdout.write(JSON.stringify(list.map(({ id, name, kind, os, bg, lan }) => ({ id, name, kind, os, background: bg, address: lan ? lan.ip + ':' + lan.port : null })), null, 2) + '\n');
+  else if (!list.length) say(C.dim('no devices on ' + where() + ' yet') + (LOCAL && lanTrouble() ? C.err(' (' + lanTrouble() + ')') : ''));
   else {
     const w = Math.max(...list.map((p) => p.name.length));
-    for (const p of list) process.stdout.write(p.name.padEnd(w + 2) + p.kind + (p.os ? ' · ' + p.os : '') + (p.bg ? '  (in background)' : '') + '\n');
+    for (const p of list) process.stdout.write(p.name.padEnd(w + 2) + (p.kind + (p.os ? ' · ' + p.os : '')).padEnd(20) + (p.lan ? p.lan.ip : 'browser') + (p.bg ? '  (in background)' : '') + '\n');
   }
   return 0;
 }
@@ -2566,24 +2794,23 @@ async function main() {
   const dl = path.join(HOME, 'Downloads');
   OUT = expand(o.f.out || process.env.LOCALDROP_OUT || conf.out || (isDir(dl) ? dl : process.cwd()));
   ICE = (process.env.LOCALDROP_ICE || (Array.isArray(conf.ice) ? conf.ice.join(',') : '')).split(',').map((s) => s.trim()).filter(Boolean);
-  if (!ICE.length) ICE = DEFAULT_ICE;
   if (o.f.room != null) {
     const v = normCode(o.f.room);
     if (!validCode(v)) { say('localdrop: room codes are 6 to 32 letters or digits'); return 2; }
     room = v;
   }
   if (o.cmd === 'serve') return cmdServe(o);
-  if (o.cmd === 'host') {
-    HOSTED = await startRelay({ port: o.f.port || 8080, bind: o.f.bind || '0.0.0.0', web: o.f.web ? expand(o.f.web) : '' });
-    SERVER = HOSTED.local;
-    SHARE = HOSTED.lan || HOSTED.local;
-  } else SERVER = normServer(o.f.server || process.env.LOCALDROP_SERVER || conf.server);
+  const given = normServer(o.f.server || '');
+  if (o.f.server != null && !given) { say('localdrop: not a web address: ' + o.f.server); return 2; }
+  SERVER = o.cmd === 'host' || o.f.local ? '' : given || normServer(process.env.LOCALDROP_SERVER || conf.server);
+  if (!ICE.length && SERVER) ICE = DEFAULT_ICE;
+  if (!SERVER) await startLocal(o);
   if (o.cmd === 'tui' || o.cmd === 'host') return runTui(o);
-  if (!SERVER) { say('localdrop: no relay configured. pass --server <url> (where index.php is hosted), set LOCALDROP_SERVER, or run "localdrop host".'); return 2; }
   let quitting = false;
   const bye = async (code) => { if (quitting) return; quitting = true; await stopCore(); process.exit(code); };
   process.on('SIGINT', () => bye(130));
   process.on('SIGTERM', () => bye(143));
+  process.on('SIGHUP', () => bye(129));
   const code = await (o.cmd === 'send' ? cmdSend(o) : o.cmd === 'recv' ? cmdRecv(o) : cmdDevices(o));
   await bye(code);
 }
